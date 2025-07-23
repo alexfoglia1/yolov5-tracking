@@ -327,6 +327,9 @@ class LoadImages:
         if isinstance(path, str) and Path(path).suffix == ".txt":  # *.txt file with img/vid/dir on each line
             path = Path(path).read_text().rsplit()
         files = []
+        print("LoadImages, path: {}".format(path))
+        #if "application/x-rtp" in path:
+            
         for p in sorted(path) if isinstance(path, (list, tuple)) else [path]:
             p = str(Path(p).resolve())
             if "*" in p:
@@ -431,12 +434,10 @@ class LoadImages:
 
 
 class LoadStreams:
-    """Loads and processes video streams for YOLOv5, supporting various sources including YouTube and IP cameras."""
+    """Loads and processes video streams for YOLOv5, supporting various sources including YouTube, IP cameras, and shared memory."""
 
     def __init__(self, sources="file.streams", img_size=640, stride=32, auto=True, transforms=None, vid_stride=1):
-        """Initializes a stream loader for processing video streams with YOLOv5, supporting various sources including
-        YouTube.
-        """
+        import mmap
         torch.backends.cudnn.benchmark = True  # faster for fixed-size inference
         self.mode = "stream"
         self.img_size = img_size
@@ -446,84 +447,109 @@ class LoadStreams:
         n = len(sources)
         self.sources = [clean_str(x) for x in sources]  # clean source names for later
         self.imgs, self.fps, self.frames, self.threads = [None] * n, [0] * n, [0] * n, [None] * n
+
         for i, s in enumerate(sources):  # index, source
-            # Start thread to read frames from video stream
             st = f"{i + 1}/{n}: {s}... "
-            if urlparse(s).hostname in ("www.youtube.com", "youtube.com", "youtu.be"):  # if source is YouTube video
-                # YouTube format i.e. 'https://www.youtube.com/watch?v=Zgi9g1ksQHc' or 'https://youtu.be/LNwODJXcvt4'
+
+            if str(s).startswith("shm://"):
+                print(f"{st} Initializing shared memory stream")
+                shm_tag = "Local\\shm_yolo_frame"
+                WIDTH, HEIGHT, CHANNELS = 640, 480, 3
+                FRAME_SIZE = WIDTH * HEIGHT * CHANNELS
+                TOTAL_SIZE = FRAME_SIZE + 1
+
+                mm = mmap.mmap(-1, TOTAL_SIZE, shm_tag, access=mmap.ACCESS_READ)
+                self.imgs[i] = np.zeros((HEIGHT, WIDTH, CHANNELS), dtype=np.uint8)
+                self.fps[i] = 30
+                self.frames[i] = float('inf')
+
+                def shm_reader(idx, mmap_obj):
+                    while True:
+                        mmap_obj.seek(0)
+                        if mmap_obj.read_byte() == 1:
+                            frame_data = mmap_obj.read(FRAME_SIZE)
+                            frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((HEIGHT, WIDTH, CHANNELS))
+                            self.imgs[idx] = frame
+                            mmap_obj.seek(0)
+                        time.sleep(0.005)
+
+                t = Thread(target=shm_reader, args=(i, mm), daemon=True)
+                self.threads[i] = t
+                LOGGER.info(f"{st} Success (Shared memory stream {WIDTH}x{HEIGHT} @ 30 FPS)")
+                t.start()
+                continue
+
+            if urlparse(s).hostname in ("www.youtube.com", "youtube.com", "youtu.be"):
                 check_requirements(("pafy", "youtube_dl==2020.12.2"))
                 import pafy
+                s = pafy.new(s).getbest(preftype="mp4").url
 
-                s = pafy.new(s).getbest(preftype="mp4").url  # YouTube URL
-            s = eval(s) if s.isnumeric() else s  # i.e. s = '0' local webcam
+            s = eval(s) if s.isnumeric() else s
             if s == 0:
                 assert not is_colab(), "--source 0 webcam unsupported on Colab. Rerun command in a local environment."
                 assert not is_kaggle(), "--source 0 webcam unsupported on Kaggle. Rerun command in a local environment."
-            cap = cv2.VideoCapture(s)
+            if "!" in s and "appsink" in s:
+                print("LoadStreams, GSTREAMER")
+                cap = cv2.VideoCapture(s, cv2.CAP_GSTREAMER)
+            else:
+                cap = cv2.VideoCapture(s)
             assert cap.isOpened(), f"{st}Failed to open {s}"
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS)  # warning: may return 0 or nan
-            self.frames[i] = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0) or float("inf")  # infinite stream fallback
-            self.fps[i] = max((fps if math.isfinite(fps) else 0) % 100, 0) or 30  # 30 FPS fallback
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            self.frames[i] = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0) or float("inf")
+            self.fps[i] = max((fps if math.isfinite(fps) else 0) % 100, 0) or 30
 
-            _, self.imgs[i] = cap.read()  # guarantee first frame
+            _, self.imgs[i] = cap.read()
             self.threads[i] = Thread(target=self.update, args=([i, cap, s]), daemon=True)
             LOGGER.info(f"{st} Success ({self.frames[i]} frames {w}x{h} at {self.fps[i]:.2f} FPS)")
             self.threads[i].start()
-        LOGGER.info("")  # newline
+        LOGGER.info("")
 
-        # check for common shapes
         s = np.stack([letterbox(x, img_size, stride=stride, auto=auto)[0].shape for x in self.imgs])
-        self.rect = np.unique(s, axis=0).shape[0] == 1  # rect inference if all shapes equal
+        self.rect = np.unique(s, axis=0).shape[0] == 1
         self.auto = auto and self.rect
-        self.transforms = transforms  # optional
+        self.transforms = transforms
         if not self.rect:
-            LOGGER.warning("WARNING ⚠️ Stream shapes differ. For optimal performance supply similarly-shaped streams.")
+            LOGGER.warning("WARNING  Stream shapes differ. For optimal performance supply similarly-shaped streams.")
 
     def update(self, i, cap, stream):
-        """Reads frames from stream `i`, updating imgs array; handles stream reopening on signal loss."""
-        n, f = 0, self.frames[i]  # frame number, frame array
+        n, f = 0, self.frames[i]
         while cap.isOpened() and n < f:
             n += 1
-            cap.grab()  # .read() = .grab() followed by .retrieve()
+            cap.grab()
             if n % self.vid_stride == 0:
                 success, im = cap.retrieve()
                 if success:
                     self.imgs[i] = im
                 else:
-                    LOGGER.warning("WARNING ⚠️ Video stream unresponsive, please check your IP camera connection.")
+                    LOGGER.warning("WARNING  Video stream unresponsive, please check your IP camera connection.")
                     self.imgs[i] = np.zeros_like(self.imgs[i])
-                    cap.open(stream)  # re-open stream if signal was lost
-            time.sleep(0.0)  # wait time
+                    cap.open(stream)
+            time.sleep(0.0)
 
     def __iter__(self):
-        """Resets and returns the iterator for iterating over video frames or images in a dataset."""
         self.count = -1
         return self
 
     def __next__(self):
-        """Iterates over video frames or images, halting on thread stop or 'q' key press, raising `StopIteration` when
-        done.
-        """
         self.count += 1
-        if not all(x.is_alive() for x in self.threads) or cv2.waitKey(1) == ord("q"):  # q to quit
+        if not all(x.is_alive() for x in self.threads) or cv2.waitKey(1) == ord("q"):
             cv2.destroyAllWindows()
             raise StopIteration
 
         im0 = self.imgs.copy()
         if self.transforms:
-            im = np.stack([self.transforms(x) for x in im0])  # transforms
+            im = np.stack([self.transforms(x) for x in im0])
         else:
-            im = np.stack([letterbox(x, self.img_size, stride=self.stride, auto=self.auto)[0] for x in im0])  # resize
-            im = im[..., ::-1].transpose((0, 3, 1, 2))  # BGR to RGB, BHWC to BCHW
-            im = np.ascontiguousarray(im)  # contiguous
+            im = np.stack([letterbox(x, self.img_size, stride=self.stride, auto=self.auto)[0] for x in im0])
+            im = im[..., ::-1].transpose((0, 3, 1, 2))
+            im = np.ascontiguousarray(im)
 
         return self.sources, im, im0, None, ""
 
     def __len__(self):
-        """Returns the number of sources in the dataset, supporting up to 32 streams at 30 FPS over 30 years."""
-        return len(self.sources)  # 1E12 frames = 32 streams at 30 FPS for 30 years
+        return len(self.sources)
 
 
 def img2label_paths(img_paths):

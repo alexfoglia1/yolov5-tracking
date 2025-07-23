@@ -34,6 +34,7 @@ import os
 import platform
 import sys
 from pathlib import Path
+import numpy as np
 
 import torch
 
@@ -148,14 +149,26 @@ def run(
         run(source='data/videos/example.mp4', weights='yolov5s.pt', conf_thres=0.4, device='0')
         ```
     """
+    import mmap
+    import struct
+    MAX_DET = 100
+    SHM_SIZE = 1 + 4 + MAX_DET * (32 + 4 + 4 * 4)
+    shm_out = mmap.mmap(-1, SHM_SIZE, tagname="Local\\shm_yolo_dets", access=mmap.ACCESS_WRITE)
+
     source = str(source)
-    save_img = not nosave and not source.endswith(".txt")  # save inference images
+    is_shmem = source.startswith("shm://")
+    save_img = not nosave and not source.endswith(".txt") and not is_shmem  # save inference images
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
     is_url = source.lower().startswith(("rtsp://", "rtmp://", "http://", "https://"))
     webcam = source.isnumeric() or source.endswith(".streams") or (is_url and not is_file)
+    
+    if is_shmem:
+        print("Detected shmem")
     screenshot = source.lower().startswith("screen")
     if is_url and is_file:
         source = check_file(source)  # download
+    elif is_url:
+        print("URL: {}".format(source))
 
     # Directories
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
@@ -169,7 +182,7 @@ def run(
 
     # Dataloader
     bs = 1  # batch_size
-    if webcam:
+    if webcam or is_shmem:
         view_img = check_imshow(warn=True)
         dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
         bs = len(dataset)
@@ -214,6 +227,8 @@ def run(
 
         # Define the path for the CSV file
         csv_path = save_dir / "predictions.csv"
+        
+        
 
         # Create or append to the CSV file
         def write_to_csv(image_name, prediction, confidence):
@@ -225,8 +240,28 @@ def run(
                 if not file_exists:
                     writer.writeheader()
                 writer.writerow(data)
+                
+        def write_shmem_pred(shmem_pred):
+            shm_out.seek(0)
+            shm_out.write_byte(0)  # flag = not ready
 
+            count = min(len(shmem_pred), MAX_DET)
+            shm_out.write(struct.pack("i", count))
+
+            for label, conf, bbox in shmem_pred[:count]:
+                label_bytes = label.encode("utf-8")[:32]
+                label_bytes += b"\x00" * (32 - len(label_bytes))  # padding
+                shm_out.write(label_bytes)
+                shm_out.write(struct.pack("f", np.float32(conf)))  # force float32
+                for vertex in bbox:
+                    shm_out.write(struct.pack("f", np.float32(vertex)))
+
+            shm_out.seek(0)
+            shm_out.write_byte(1)  # flag = ready
+            print("!")
+            
         # Process predictions
+        shmem_pred = []
         for i, det in enumerate(pred):  # per image
             seen += 1
             if webcam:  # batch_size >= 1
@@ -234,11 +269,19 @@ def run(
                 s += f"{i}: "
             else:
                 p, im0, frame = path, im0s.copy(), getattr(dataset, "frame", 0)
-
-            p = Path(p)  # to Path
+            
+            if not is_shmem:
+                p = Path(p)  # to Path
+            else:
+                p = Path("shmem")
             save_path = str(save_dir / p.name)  # im.jpg
             txt_path = str(save_dir / "labels" / p.stem) + ("" if dataset.mode == "image" else f"_{frame}")  # im.txt
+
             s += "{:g}x{:g} ".format(*im.shape[2:])  # print string
+            #print("im: {}".format(im))
+            #print("im0: {}".format(im0))
+            #continue
+            im0 = im0[0]
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
@@ -257,10 +300,13 @@ def run(
                     label = names[c] if hide_conf else f"{names[c]}"
                     confidence = float(conf)
                     confidence_str = f"{confidence:.2f}"
-
+                    
                     if save_csv:
                         write_to_csv(p.name, label, confidence_str)
 
+                    if is_shmem:
+                        bbox = torch.tensor(xyxy).view(1, 4).tolist()[0]
+                        shmem_pred.append((label, confidence, bbox))
                     if save_txt:  # Write to file
                         if save_format == 0:
                             coords = (
@@ -281,7 +327,7 @@ def run(
 
             # Stream results
             im0 = annotator.result()
-            if view_img:
+            if view_img and not is_shmem:
                 if platform.system() == "Linux" and p not in windows:
                     windows.append(p)
                     cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
@@ -308,8 +354,11 @@ def run(
                         vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
                     vid_writer[i].write(im0)
 
-        # Print time (inference-only)
-        LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1e3:.1f}ms")
+        if is_shmem:
+            write_shmem_pred(np.array(shmem_pred, dtype=object))
+        else:
+            # Print time (inference-only)
+            LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1e3:.1f}ms")
 
     # Print results
     t = tuple(x.t / seen * 1e3 for x in dt)  # speeds per image
